@@ -1,0 +1,8 @@
+{
+  "rank_label": null,
+  "labels": {},
+  "metrics": {
+    "running": "vllm:num_requests_running",
+    "waiting": "vllm:num_requests_waiting"
+  }
+}

@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llm-decode-bench"
+version = "0.1.0"
+description = "Auditable fixed-cohort mixed-length LLM decode benchmarks"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["aiohttp>=3.9,<4"]
+
+[project.optional-dependencies]
+tokenizer = ["transformers>=4.40,<6"]
+
+[project.scripts]
+llm-decode-bench = "llm_decode_bench.cli:entrypoint"
+
+[tool.setuptools.packages.find]
+where = ["src"]
