@@ -1,4 +1,5 @@
-"""Deterministic public synthetic inputs or user-owned JSONL, never private corpora."""
+"""Synthetic inputs and user-selected text/token JSONL (optionally gzip)."""
+import gzip
 import json
 import random
 from pathlib import Path
@@ -8,7 +9,8 @@ from .io import digest, write_json
 
 def load_dataset(path, count):
     rows = []
-    with Path(path).open() as f:
+    opener = gzip.open if str(path).endswith('.gz') else open
+    with opener(path, 'rt', encoding='utf-8') as f:
         for line in f:
             if not line.strip():
                 continue

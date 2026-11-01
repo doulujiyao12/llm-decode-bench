@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "created_date": "2026-11-01",
+  "source": {
+    "kind": "owner-authorized recorded real traffic",
+    "original_requests": 40,
+    "frozen_corpus_sha256": "54994323b64297f35736d29408def6d48757d1f03915d84f29f814d7db4f9ff3",
+    "capture_date": "2026-09-09",
+    "public_release_authorized_date": "2026-11-01"
+  },
+  "reference_tokenizer": "private HY4 tokenizer used on source host only; no tokenizer/model assets included",
+  "format": "UTF-8 JSONL gzip; text field re-tokenized with the target model",
+  "basic": {
+    "records": 512,
+    "distinct_original_requests": 39,
+    "operation": "redact complete decoded source first, then take deterministic contiguous token-window excerpts; no padding or concatenation",
+    "seed": 20261101,
+    "source_window_tokens": [
+      2048,
+      4096,
+      8192,
+      16384
+    ],
+    "interpretation": "512 distinct excerpts from 40 recorded source requests; NOT 512 independent production requests"
+  },
+  "long_context": {
+    "operation": "decode prefix_ids + tail_ids for each full source request, remove model control tokens and redact",
+    "interpretation": "full rendered prompt text, not original messages/tools API bodies"
+  },
+  "redaction_counts": {
+    "model_control_token": 12157,
+    "private_key": 0,
+    "credential": 0,
+    "bearer": 0,
+    "secret_assignment": 22,
+    "email": 49,
+    "url": 4991,
+    "ipv4": 1070,
+    "phone": 0,
+    "uuid": 98,
+    "long_hex": 89,
+    "private_path": 15
+  },
+  "files": {
+    "basic.jsonl.gz": {
+      "records": 512,
+      "unique_texts": 512,
+      "source_requests": 39,
+      "bytes": 5104436,
+      "uncompressed_bytes": 15500208,
+      "sha256": "5a69fb69f08b885dc7ccbaa8e9a09ece3603aa17219bfcdbcfb326749477e128",
+      "jsonl_sha256": "6612dd7b72639fdb9413f70287680c7e75efbcfcff978593fbc87a860b2ceecd",
+      "reference_content_tokens": {
+        "min": 2044,
+        "max": 16385,
+        "mean": 7679.8125
+      }
+    },
+    "long-context.jsonl.gz": {
+      "records": 40,
+      "unique_texts": 40,
+      "source_requests": 40,
+      "bytes": 5474656,
+      "uncompressed_bytes": 18017562,
+      "sha256": "d0600848fb2e8e677764736ebe743b02b98b2d1f497bac02598eca006358a99a",
+      "jsonl_sha256": "b88683b8e07b3e2b7940a34921151db9bba956203407d7d2fe8d5bac351d11f2",
+      "reference_content_tokens": {
+        "min": 565,
+        "max": 280685,
+        "mean": 116660.6
+      }
+    }
+  },
+  "limits": [
+    "Subsamples are correlated and cannot estimate production-wide traffic distributions.",
+    "Basic excerpts are not an answer-quality or MTP acceptance evaluation dataset.",
+    "No original arrival timing, image payloads, tools API replay, or target-model exact length guarantee.",
+    "Reference token counts exclude the target model chat wrapper; client re-tokenization is required."
+  ]
+}

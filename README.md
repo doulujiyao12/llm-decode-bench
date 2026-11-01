@@ -6,6 +6,100 @@ Portable fixed-cohort, mixed-length decode benchmarks. SSE-only by default; opti
 
 > **SSE gap ≠ token TPOT ≠ GPU step。** 本工具不按 MTP 接受长度折算时间，也不把 TCP 分包数当作 token 数。精度/接受率/线上吞吐需要单独评测。
 
+## 只分享一个 Python 文件：`decode_sse_bench.py`
+
+**只复制仓库根目录的 `decode_sse_bench.py` 即可运行，不依赖本仓库其他模块。** 不修改服务启动参数、不安装插件、不抓 GPU trace、不清空服务缓存。认证读取 `OPENAI_API_KEY`，客户端不需要 GPU。
+
+```bash
+python3 -m pip install aiohttp transformers
+python3 decode_sse_bench.py --help
+# 可选：内置单测 + 本机 HTTP 模拟测试，不使用模型/GPU
+python3 decode_sse_bench.py --self-test
+```
+
+### 四种输入模式
+
+| `--mode` | 长度与内容 | 可复现性 |
+| --- | --- | --- |
+| `1` | 每个请求同长度，独立随机 token 前缀 | 固定输入和生成种子 |
+| `2` | 每个 rank 长短混合，整数 token 的平均值严格等于指定值，独立前缀 | 固定长度分配、输入和生成种子 |
+| `3` | 同样严格保持每 rank 平均值，每次重新随机分配长度和输入 | 记录有效 `run_seed`，可用 `--replay-seed` 重放 |
+| `4` | 从真实 JSON/JSONL 影子数据中选取不同的完整文本/对话 | 每次随机选取，记录种子和输入哈希；**不截断、不补文本、不重复凑并发** |
+
+`--input-lengths-k` 在模式 2～4 表示**每个 rank 的平均输入长度**，K=1024。模式 2/3 默认长度范围为平均值的 0.25～1.75 倍，可用 `--min-length-ratio` / `--max-length-ratio` 修改。BS=1 时不可能形成长短混合。
+
+模式 4 的自然长度不一定能凑出精确均值：默认容差 1%，`--shadow-mean-tolerance` 可调整；找不到符合要求的样本集合就失败，不会悄悄改内容。真实输入文件放在自选目录：
+
+```json
+{"text":"完整的真实请求文本"}
+{"messages":[{"role":"user","content":"完整的真实问题"}]}
+```
+
+也支持标准 ShareGPT `conversations`。需要足够多的不同请求；暂不接受图像/工具调用数据，避免丢字段改变语义。不会把原始输入或生成内容保存到结果，更不会自动上传影子数据。
+
+仓库现在附带已获源数据所有者公开授权的 [真实影子文本样本](shadow/README.md)：`shadow/basic.jsonl.gz` 有 **512 个脱敏真实内容片段（来自 39 条源请求）**，`shadow/long-context.jsonl.gz` 有 **40 条完整渲染文本**；合计约 **10.58 MB**。512 个片段不是 512 条独立生产请求。模式 4 不传 `--shadow-dir` 时默认读取基础集；也可以指定一个 `.jsonl.gz` 文件，无需解压。基础集约 2K～16K，不能拿来冒充 100K 上下文数据。具体命令、样本来源、长文本数量限制和校验值见数据说明。
+
+### 直接测试已启动的 SGLang
+
+```bash
+python3 decode_sse_bench.py \
+  --base-url http://127.0.0.1:31000 \
+  --backend sglang --model hy4 \
+  --tokenizer /data/models/hy4 \
+  --dp-size 8 --batch-sizes 16 32 \
+  --mode 2 --input-lengths-k 32 64 100 \
+  --seed 60 --generation-seed 60 \
+  --output-tokens 2048 --ignore-eos \
+  --measure-seconds 10 --plot
+```
+
+`--ignore-eos` 仅用于已支持该参数的服务，不支持就去掉；输出过早结束时本组失败，不会拿剩余请求冒充原 BS。换模式只需改 `--mode`；模式 4 另加 `--shadow-dir /path/to/traffic`。种子固定的是请求内容和采样参数，**不保证跨后端/批处理顺序的输出逐字一致**。
+
+脚本会依次：构造完整请求集合 → 容量预检 → 每个输入预热 1 token → 再探测全部输入的缓存命中 → 同时发送正式请求 → 所有流开始持续输出后等待 3 秒 → 采集 10 秒公共窗口。默认继续读完输出，校验最终 usage；并不补充新请求。
+
+### 容量不足：默认退出，可显式共享前缀
+
+默认自动读取 SGLang `/server_info` 的**每个 attention DP rank 的 KV token 池容量**；不根据空闲显存推算。多个 scheduler 上报不同容量时取最小值。接口不提供可靠容量时，必须手动指定：
+
+```bash
+# 与旧摸高参数一致：这是每卡/每 attention-DP rank 的 token 容量，不是全机总和
+--max-total-kvcache-length-k 3500
+# 也可以给精确 token 数（两种手动参数不能同时使用）
+--kv-capacity-tokens 3584000
+```
+
+默认使用容量的 95%，剩余作为安全余量，可用 `--capacity-fraction` 修改。预算包括按 KV page 对齐的输入和 **BS × 输出 token 上限**，不忽略 decoding 期间的 KV 增长。手动值高于可探测的服务上限时取较低值。`--page-size` 可以覆盖服务上报的 KV page token 数；没有上报时默认保守按 256 计。
+
+例如独立输入、每卡 BS32、100K 上下文、2048 输出，输入+输出约需 **3264K token/卡**，再和安全预算比较；BS64 约需 **6528K/卡**。这和所有请求共用一条 100K 前缀的显存需求不同。
+
+默认不够就退出，**该组不会发任何生成请求**，并保留错误报告。若明确接受改变工作负载，加：
+
+```bash
+--allow-shared-prefix
+```
+
+只有当前组的独立前缀放不下时才启用：同一个 rank 的请求共享部分前缀，仍保留独立后缀（默认至少 128 token，`--min-unique-suffix-tokens` 可调），长度和均值保持不变。混合长度采用嵌套共同前缀，使短请求和长请求都能分享已有部分。尽可能少共享到满足预算；即使最大共享仍装不下，也会退出。
+
+**共享前缀会改变显存需求、访问局部性和工作负载，不能把它与独立前缀结果当作同一个基准。** 结果明确记录 `prefix_workload` 和每个请求的共享长度。模式 4 只利用真实内容自然具有的相同前缀，即便加了该参数，也不会人为改写真实请求来省显存。
+
+想先看容量计划、不发送任何生成请求，加 `--plan-only`。容量预估不是运行时 OOM 保证：其他流量、临时激活、路由、驱逐和不同后端实现仍可能导致失败。本脚本不是 HiSparse 热 KV/CPU offload 容量测量工具。
+
+### 什么条件才算结果可信
+
+- 缓存：默认要求探测和正式请求都报告 `cached_tokens`，至少命中 98%，且未命中尾部不超过 256 token，两项同时满足。允许少量尾页重算，不宣称 100% 命中；可用 `--min-cache-hit-ratio` 和 `--cache-tail-tokens` 收紧。已知未命中直接失败；接口缺少计数时，仅显式 `--allow-unverified-cache` 才允许继续，并标为 `unverified`。
+- 每卡 BS：SGLang native 默认用 `routed_dp_rank` 固定请求归属；如果服务没有该扩展，可加 `--no-route-dp`，但不能再保证每 rank 的长度分布和 cache affinity。通用 OpenAI 接口同理。
+- 稳态：默认尝试读取 metrics，要求所有 rank 的 running 都等于指定 BS、等待队列为 0；缺少指标会明确降级为 `client_only_unverified`。**要强制每卡 BS 验证，加 `--steady-check required`**。可通过 `--metrics-url`、`--running-metric`、`--waiting-metric`、`--rank-label`、`--metric-label` 适配现有服务；全局 running 指标不能冒充多个 rank 的指标。
+- PD：从已部署的完整 router/P-D 入口发请求，不能直接把普通请求发给仅 D 的端口来代替 bootstrap/KV 传输。metrics 需要指向 D；`--pd-metrics` 额外要求 prealloc/transfer 队列清空。路由器未透传 DP pinning 时需关闭 pinning；跨机器/实例前缀不会因客户端预热自动共享。
+- SSE：统计完整生成进度事件之间的间隔，忽略 keepalive、纯 role、usage 和 DONE；不是 TCP 包间隔。MTP 或 `stream_interval` 可能使一次事件含多个 token，也可能把一步拆为多次发送；**不保证一次 SSE 就是一次 GPU step**。
+
+OpenAI-compatible completions 可选 `--backend openai`，需要支持 token-ID `prompt`。仅有 chat 接口的服务使用 `--backend openai-chat --mode 4`，本地 tokenizer/chat template 必须与服务一致；如果服务报告的 prompt token 数不一致就失败，不用字符数冒充 token 数。脚本不保证任意厂商接口都能验证缓存/每卡 BS。
+
+### 输出文件
+
+每次生成一个 `results/sse_日期时间_随机标识/`：`config.json`、`results.json`、`summary.csv`；加 `--plot` 生成 `sse_gap.svg`。图为每请求 SSE gap 中位数的中位数；CSV 同时包含均值和合并间隔的 P99。不除以 MTP 接受长度，也不计算模型精度。
+
+默认排空输出以拿到最终缓存 usage，采样结束后可能还要等一段时间。`--stop-after-measure` 只关闭本脚本的 HTTP 流，不清缓存、不全局 abort；不同服务可能继续后台生成，OpenAI 最终 usage 也可能缺失，因此通常不建议在连续矩阵中使用。
+
 ## 1. 能做什么
 
 - 同长输入、长短混合输入、共享长前缀，使用同一套测试流程。
