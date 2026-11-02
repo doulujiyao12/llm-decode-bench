@@ -4,10 +4,14 @@
 Copy ONLY this file. Dependencies: pip install aiohttp transformers
 No server changes, GPU profiler, package imports, cache flush or global abort.
 
-Modes: 1=uniform deterministic, 2=mixed deterministic, 3=mixed fresh random,
+Modes: 0=identical shared prefix, 1=uniform deterministic,
+2=mixed deterministic, 3=mixed fresh random,
 4=unaltered real text/messages selected from --shadow-dir (JSON/JSONL).
-Modes 1-3 use token-ID prompts: /generate or /v1/completions, NOT chat-only APIs.
+Modes 0-3 use token-ID prompts: /generate or /v1/completions, NOT chat-only APIs.
 Mode 4 also supports /v1/chat/completions with a matching local chat template.
+Mode 0 uses one seeded token sequence across all requests/ranks/BS values;
+shorter inputs are slices of that sequence. KV sharing is budgeted PER rank,
+with private input-tail and output reserves, never as a cross-GPU cache.
 
 Capacity is per ATTENTION DP rank, not the sum over TP GPUs. Default: read
 SGLang /server_info; otherwise require --max-total-kvcache-length-k (K=1024).
@@ -37,6 +41,7 @@ import argparse
 import asyncio
 from array import array
 import codecs
+from contextlib import contextmanager
 import csv
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -52,6 +57,7 @@ import re
 import secrets
 import statistics
 import sys
+import tempfile
 import time
 from urllib.parse import urlsplit
 
@@ -117,6 +123,17 @@ def rank_cost(lengths, shared, output_tokens, page):
             + len(lengths) * rounded(output_tokens, page))
 
 
+def identical_prefix_cost(input_tokens, bs, output_tokens, page):
+    """One shared prefix per rank, but reserve a private tail page per request.
+
+    Even an aligned identical prompt may recompute its last page (last-token
+    cache matching / copy-on-write). Do not count that page as fully shared,
+    and never assume generated output is identical or shared between requests.
+    """
+    shared_pages = (input_tokens - 1) // page * page
+    return shared_pages + bs * (page + rounded(output_tokens, page))
+
+
 def plan_sharing(lengths, budget, output_tokens, page, allow, min_suffix):
     none = [0] * len(lengths)
     independent = rank_cost(lengths, none, output_tokens, page)
@@ -158,7 +175,7 @@ def plan_input_sweep(args, capacity, page, bs, context_length=None):
     summary = dict(bs_per_dp=bs, requested_input_tokens=requested,
                    budget_tokens_per_rank=math.floor(capacity * args.capacity_fraction),
                    output_reserve_tokens_per_request=rounded(args.output_tokens, page))
-    if args.allow_shared_prefix or args.mode == 4:
+    if args.mode != 0 and (args.allow_shared_prefix or args.mode == 4):
         summary.update(policy='shared_prefix_requested_grid' if args.allow_shared_prefix else 'real_text_preflight',
                        auto_added_input_tokens=[], omitted_requested_input_tokens=[])
         grid = requested if args.allow_shared_prefix else sorted(set(requested))
@@ -167,10 +184,16 @@ def plan_input_sweep(args, capacity, page, bs, context_length=None):
     budget = summary['budget_tokens_per_rank']
     output = summary['output_reserve_tokens_per_request']
     mixed = args.mode in (2, 3) and bs > 1
-    per_input_budget = budget // bs - output
-    if mixed:
-        per_input_budget -= page - 1  # Every request may have a different last-page tail.
-    kv_limit = max(0, per_input_budget // page * page)
+    if args.mode == 0:
+        # Invert identical_prefix_cost: the final input page is private even
+        # when the full input is page-aligned, and every output is private.
+        prefix_budget = budget - bs * (output + page)
+        kv_limit = (prefix_budget // page + 1) * page if prefix_budget >= 0 else 0
+    else:
+        per_input_budget = budget // bs - output
+        if mixed:
+            per_input_budget -= page - 1  # Every request may have a different last-page tail.
+        kv_limit = max(0, per_input_budget // page * page)
     context_limit = None
     if type(context_length) is int and context_length > 0:
         remaining = max(0, context_length - args.output_tokens)
@@ -189,8 +212,9 @@ def plan_input_sweep(args, capacity, page, bs, context_length=None):
     added = [limit] if omitted and limit > 0 and limit not in selected else []
     entries = [dict(mean=n, origin='requested') for n in selected]
     entries.extend(dict(mean=n, origin='automatic_' + reason + '_boundary') for n in added)
-    summary.update(policy='independent_input_bound',
-                   bound_kind='conservative_mixed_mean' if mixed else 'uniform_page_aligned',
+    summary.update(policy='identical_prefix_input_bound' if args.mode == 0 else 'independent_input_bound',
+                   bound_kind=('shared_prefix_private_tail_reserved' if args.mode == 0
+                               else 'conservative_mixed_mean' if mixed else 'uniform_page_aligned'),
                    kv_input_limit_tokens=kv_limit, context_input_limit_tokens=context_limit,
                    effective_input_limit_tokens=limit, limiting_factor=reason,
                    selected_input_tokens=[entry['mean'] for entry in entries],
@@ -357,17 +381,30 @@ def select_shadow(candidates, dp, bs, mean, tolerance, rng, low_ratio, high_rati
 
 def make_case(args, tokenizer, capacity, page, bs, mean, run_seed, shadows=None):
     budget = math.floor(capacity * args.capacity_fraction)
-    seed = f'{run_seed}:mode{args.mode}:bs{bs}:mean{mean}'
+    seed = (f'{run_seed}:mode0:global-prefix' if args.mode == 0
+            else f'{run_seed}:mode{args.mode}:bs{bs}:mean{mean}')
     rng = random.Random(seed)
     by_rank, costs, plans = [], [], []
+    identical_ids = None
     if args.mode == 4:
         cohorts = select_shadow(shadows, args.dp_size, bs, mean, args.shadow_mean_tolerance,
                                 rng, args.min_length_ratio, args.max_length_ratio)
     else:
         vocab = sorted(set(tokenizer.get_vocab().values()) - set(tokenizer.all_special_ids))
         check(len(vocab) >= 2, 'Tokenizer has fewer than 2 non-special token IDs')
+        if args.mode == 0:
+            cost = identical_prefix_cost(mean, bs, args.output_tokens, page)
+            if cost > budget:
+                raise CapacityError(f'Identical-prefix KV needs {cost:,} tokens/rank, usable budget '
+                                    f'{budget:,}; includes private tail pages and output tokens.')
+            # No BS/rank/length in the seed: every case uses the same logical
+            # infinite prefix. Read-only shared array; payload() copies to list.
+            identical_ids = array('I', rng.choices(vocab, k=mean))
     for rank in range(args.dp_size):
-        if args.mode == 4:
+        if args.mode == 0:
+            lengths = [mean] * bs
+            shared = [mean] * bs
+        elif args.mode == 4:
             cohort = cohorts[rank]
             lengths = [len(x[0]) for x in cohort]
             cost = natural_prefix_cost([x[0] for x in cohort], args.output_tokens, page)
@@ -385,14 +422,16 @@ def make_case(args, tokenizer, capacity, page, bs, mean, run_seed, shadows=None)
         rank_prompts = []
         for local, length in enumerate(lengths):
             index = local * args.dp_size + rank
-            if args.mode == 4:
+            if args.mode == 0:
+                ids, msgs = identical_ids, None
+            elif args.mode == 4:
                 ids, msgs = cohort[local]
             else:
                 prng = random.Random(f'{seed}:input:{rank}:{local}')
                 ids = common[:shared[local]]
                 ids.extend(prng.choices(vocab, k=length - shared[local]))
                 msgs = None
-            gseed = (args.generation_seed + index if args.mode in (1, 2)
+            gseed = (args.generation_seed + index if args.mode in (0, 1, 2)
                      else rng.randrange(0, 2**31 - 1))
             rank_prompts.append(Prompt(index, rank, ids, gseed, shared[local], msgs))
         by_rank.extend(rank_prompts)
@@ -400,14 +439,19 @@ def make_case(args, tokenizer, capacity, page, bs, mean, run_seed, shadows=None)
         plans.append(dict(rank=rank, min=min(lengths), max=max(lengths), mean=statistics.mean(lengths),
                           sum_input_tokens=sum(lengths), estimated_kv_tokens=cost,
                           max_synthetic_shared_tokens=max(shared)))
-    check(len({digest_ids(p.ids) for p in by_rank}) == len(by_rank),
-          'Duplicate prompts found; increase input/suffix lengths or vocabulary')
+    unique_inputs = len({digest_ids(p.ids) for p in by_rank})
+    if args.mode == 0:
+        check(unique_inputs == 1, 'Mode 0 requires identical input tokens for every request')
+    else:
+        check(unique_inputs == len(by_rank),
+              'Duplicate prompts found; increase input/suffix lengths or vocabulary')
     return sorted(by_rank, key=lambda p: p.index), dict(
         mode=args.mode, bs_per_dp=bs, dp_size=args.dp_size, mean_input_tokens_requested=mean,
         run_seed=run_seed, case_seed=seed, capacity_tokens_per_rank=capacity,
         usable_capacity_tokens_per_rank=budget, output_reserve_tokens_per_request=args.output_tokens,
         page_size=page, rank_plans=plans,
-        prefix_workload=('capacity_shared_synthetic' if any(p.shared_tokens for p in by_rank)
+        prefix_workload=('fully_shared_synthetic' if args.mode == 0
+                         else 'capacity_shared_synthetic' if any(p.shared_tokens for p in by_rank)
                          else 'natural_semantic' if args.mode == 4 else 'independent_synthetic'))
 
 
@@ -750,6 +794,49 @@ async def measure(session, args, prompts, bs, use_metrics):
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
+@contextmanager
+def atomic_text_output(path):
+    """Replace one complete file; interruption cannot truncate its prior version."""
+    path = Path(path)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', newline='',
+                                         dir=path.parent, prefix=f'.{path.name}.',
+                                         suffix='.tmp', delete=False) as stream:
+            temporary = Path(stream.name)
+            yield stream
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def save_results(out, results, sweep_plans, plot):
+    """Checkpoint between cases, never in an active SSE measurement window.
+
+    Atomicity is per file, not a transaction across JSON/CSV/SVG. Full JSON is
+    streamed to disk to avoid a second large in-memory serialization buffer.
+    Only validated, completed cases are plotted by plot_svg().
+    """
+    with atomic_text_output(out / 'results.json') as stream:
+        json.dump(results, stream, ensure_ascii=False, indent=2)
+    with atomic_text_output(out / 'sweep_plan.json') as stream:
+        json.dump(sweep_plans, stream, ensure_ascii=False, indent=2)
+    with atomic_text_output(out / 'summary.csv') as stream:
+        fields = ['status', 'bs_per_dp', 'mean_input_tokens_requested', 'prefix_workload',
+                  'input_length_origin', 'theoretical_input_limit_tokens',
+                  'sse_gap_mean_ms', 'sse_gap_median_ms', 'pooled_sse_gap_p99_ms',
+                  'bs_verification', 'cache_verification']
+        writer = csv.DictWriter(stream, fieldnames=fields, extrasaction='ignore')
+        writer.writeheader()
+        for result in results:
+            writer.writerow({**result, **result.get('measurement', {})})
+    if plot:
+        plot_svg(results, out / 'sse_gap.svg')
+
+
 def plot_svg(results, path):
     good = [r for r in results if r.get('status') == 'ok']
     if not good:
@@ -781,7 +868,8 @@ def plot_svg(results, path):
         px = pad + (w - 2 * pad) * x / xmax
         out.append(f'<text x="{px-12}" y="{h-pad+20}" font-size="12">{x:g}K</text>')
     out += ['<text x="14" y="55" font-size="12">ms</text>', '</svg>']
-    path.write_text('\n'.join(out), encoding='utf-8')
+    with atomic_text_output(path) as stream:
+        stream.write('\n'.join(out))
 
 
 async def get_info(session, base):
@@ -828,7 +916,11 @@ async def run(args):
           and not url.query and not url.fragment, 'Use an http(s) base URL without embedded credentials/query')
     key = os.environ.get(args.api_key_env)
     headers = {'Authorization': f'Bearer {key}'} if key else {}
-    async with aiohttp.ClientSession(headers=headers, connector=aiohttp.TCPConnector(limit=0),
+    # A long warmup may outlive the server's idle keep-alive timeout. Reusing
+    # those connections for non-idempotent POSTs can race a server-side close.
+    # Each request gets one connection; its SSE stream still stays open for the
+    # entire generation, so this does not add a handshake per measured event.
+    async with aiohttp.ClientSession(headers=headers, connector=aiohttp.TCPConnector(limit=0, force_close=True),
                                      trust_env=False) as session:
         info = await get_info(session, args.base_url)
         if args.backend == 'auto':
@@ -870,7 +962,7 @@ async def run(args):
                 use_metrics = False
                 log('WARNING: metrics unavailable/ambiguous; CLIENT-ONLY results. Use --steady-check required '
                     'to refuse this, or configure metric names/labels.')
-        run_seed = (args.replay_seed if args.replay_seed is not None else args.seed if args.mode in (1, 2)
+        run_seed = (args.replay_seed if args.replay_seed is not None else args.seed if args.mode in (0, 1, 2)
                     else secrets.randbits(63))
         args.run_id = secrets.token_hex(4)
         out = Path(args.save_path) / (datetime.now(timezone.utc).strftime('sse_%Y%m%d-%H%M%S_') + args.run_id)
@@ -893,7 +985,8 @@ async def run(args):
                 entries, sweep = plan_input_sweep(args, capacity, page, bs, info.get('context_length'))
                 sweep_plans.append(sweep)
                 if sweep.get('omitted_requested_input_tokens'):
-                    log(f'BS/rank={bs}: independent input bound '
+                    prefix_kind = 'identical-prefix' if args.mode == 0 else 'independent'
+                    log(f'BS/rank={bs}: {prefix_kind} input bound '
                         f'{sweep["effective_input_limit_tokens"] / 1024:g}K '
                         f'({sweep["limiting_factor"]}); larger requested lengths omitted. '
                         f'Automatic boundary: {sweep["auto_added_input_tokens"] or "already on grid / no positive input fits"}. '
@@ -902,10 +995,11 @@ async def run(args):
                     results.append(dict(bs_per_dp=bs, status='capacity_limited',
                         theoretical_input_limit_tokens=sweep['effective_input_limit_tokens'],
                         reason='No positive input fits this BS after output, page and safety reserves'))
+                    save_results(out, results, sweep_plans, args.plot)
                     continue
                 for entry in entries:
                     mean = entry['mean']
-                    case = dict(bs_per_dp=bs, mean_input_tokens_requested=mean, status='failed',
+                    case = dict(bs_per_dp=bs, mean_input_tokens_requested=mean, status='running',
                                 input_length_origin=entry['origin'],
                                 theoretical_input_limit_tokens=sweep.get('effective_input_limit_tokens'))
                     results.append(case)
@@ -917,6 +1011,7 @@ async def run(args):
                         case.update(status='capacity_limited', reason=str(exc))
                         sweep['stopped_at_input_tokens'] = mean
                         log(f'BS/rank={bs}: {exc}; ending this BS, continuing the next BS.')
+                        save_results(out, results, sweep_plans, args.plot)
                         break
                     case.update(plan)
                     context = info.get('context_length')
@@ -935,7 +1030,11 @@ async def run(args):
                         f'{max(p["estimated_kv_tokens"] for p in plan["rank_plans"]):,}')
                     if args.plan_only:
                         case['status'] = 'planned_not_run'
+                        save_results(out, results, sweep_plans, args.plot)
                         continue
+                    # Persist prior completed cases plus the active case before a
+                    # potentially long warmup. No generated output is serialized.
+                    save_results(out, results, sweep_plans, args.plot)
                     log('Warmup all exact prompts (1 generated token each)')
                     await warm_phase(session, args, prompts, False)
                     log('Probe all exact prompts again; verify cache residency/hits before formal run')
@@ -943,29 +1042,25 @@ async def run(args):
                     case['measurement'] = await measure(session, args, prompts, bs, use_metrics)
                     case['status'] = 'ok'
                     m = case['measurement']
+                    save_results(out, results, sweep_plans, args.plot)
                     log(f'SSE gap mean/median/P99={m["sse_gap_mean_ms"]:.3f}/'
                         f'{m["sse_gap_median_ms"]:.3f}/{m["pooled_sse_gap_p99_ms"]:.3f} ms; '
                         f'{m["bs_verification"]}, {m["cache_verification"]}')
+                    log(f'Checkpoint saved: {sum(r["status"] == "ok" for r in results)} completed cases; '
+                        f'JSON/CSV{"/SVG" if args.plot else ""} updated in {out}')
             check(any(r['status'] in {'ok', 'planned_not_run'} for r in results),
                   'No requested BS has a feasible input case; reduce BS/output or increase the KV budget.')
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            if results and results[-1]['status'] == 'running':
+                results[-1].update(status='interrupted', error='Benchmark interrupted')
+            raise
         except Exception as exc:
-            if results and results[-1]['status'] == 'failed':
-                results[-1]['error'] = str(exc) if isinstance(exc, BenchError) else type(exc).__name__
+            if results and results[-1]['status'] == 'running':
+                results[-1].update(status='failed',
+                    error=str(exc) if isinstance(exc, BenchError) else type(exc).__name__)
             raise
         finally:
-            (out / 'results.json').write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding='utf-8')
-            (out / 'sweep_plan.json').write_text(json.dumps(sweep_plans, ensure_ascii=False, indent=2), encoding='utf-8')
-            with (out / 'summary.csv').open('w', newline='', encoding='utf-8') as f:
-                fields = ['status', 'bs_per_dp', 'mean_input_tokens_requested', 'prefix_workload',
-                          'input_length_origin', 'theoretical_input_limit_tokens',
-                          'sse_gap_mean_ms', 'sse_gap_median_ms', 'pooled_sse_gap_p99_ms',
-                          'bs_verification', 'cache_verification']
-                writer = csv.DictWriter(f, fieldnames=fields, extrasaction='ignore')
-                writer.writeheader()
-                for result in results:
-                    writer.writerow({**result, **result.get('measurement', {})})
-            if args.plot:
-                plot_svg(results, out / 'sse_gap.svg')
+            save_results(out, results, sweep_plans, args.plot)
 
 
 def parser():
@@ -974,7 +1069,9 @@ def parser():
     p.add_argument('--model', default='hy4')
     p.add_argument('--tokenizer', help='Matching tokenizer path/HF ID; never trust_remote_code')
     p.add_argument('--backend', choices=['auto', 'sglang', 'openai', 'openai-chat'], default='auto')
-    p.add_argument('--mode', type=int, choices=[1, 2, 3, 4], default=1)
+    p.add_argument('--mode', type=int, choices=[0, 1, 2, 3, 4], default=1,
+                   help='0=identical shared prefix, 1=uniform independent, 2=mixed fixed, '
+                        '3=mixed random, 4=real text')
     p.add_argument('--dp-size', type=int, default=8, help='Attention-DP ranks, NOT TP size')
     p.add_argument('--batch-sizes', type=int, nargs='+', default=[32], help='Requests per attention-DP rank')
     p.add_argument('--input-lengths-k', type=float, nargs='+', default=[32], help='Per-rank mean input tokens, K=1024')
@@ -991,7 +1088,8 @@ def parser():
     cap.add_argument('--kv-capacity-tokens', type=int, help='Manual token capacity PER RANK (literal tokens)')
     p.add_argument('--capacity-fraction', type=float, default=.95, help='Use this fraction of reported/manual token pool')
     p.add_argument('--page-size', type=int, help='KV page size in tokens; default server value, else conservative 256')
-    p.add_argument('--allow-shared-prefix', action='store_true', help='Opt-in capacity fallback for synthetic modes ONLY')
+    p.add_argument('--allow-shared-prefix', action='store_true',
+                   help='Opt-in capacity fallback for modes 1-3; mode 0 is always fully shared')
     p.add_argument('--min-unique-suffix-tokens', type=int, default=128)
     p.add_argument('--output-tokens', '--request-output-length', type=int, default=2048)
     p.add_argument('--temperature', type=float, default=.6)
@@ -1020,7 +1118,7 @@ def parser():
     p.add_argument('--stop-after-measure', action='store_true', help='Close own streams early; final usage may be unavailable')
     p.add_argument('--api-key-env', default='OPENAI_API_KEY')
     p.add_argument('--save-path', default='results')
-    p.add_argument('--plot', action='store_true', help='Generate dependency-free SVG chart')
+    p.add_argument('--plot', action='store_true', help='Update dependency-free SVG chart after each completed case')
     p.add_argument('--plan-only', action='store_true', help='Read-only metadata/plan; no generation requests')
     p.add_argument('--self-test', action='store_true', help='Embedded unit + local mock HTTP tests; no GPU/model downloads')
     return p
@@ -1098,6 +1196,72 @@ def self_test():
         return a
 
     class PlanningTests(unittest.TestCase):
+        def test_mode0_identical_across_ranks_bs_and_nested_lengths(self):
+            a = config(mode=0)
+            short, plan = make_case(a, FakeTokenizer(), 100000, 16, 2, 128, 60)
+            long, _ = make_case(a, FakeTokenizer(), 100000, 16, 4, 256, 60)
+            repeat, _ = make_case(a, FakeTokenizer(), 100000, 16, 2, 128, 60)
+            changed, _ = make_case(a, FakeTokenizer(), 100000, 16, 2, 128, 61)
+            self.assertEqual(plan['prefix_workload'], 'fully_shared_synthetic')
+            self.assertEqual(len(short), 4)
+            self.assertEqual({p.rank for p in short}, {0, 1})
+            self.assertEqual(len({digest_ids(p.ids) for p in short}), 1)
+            self.assertEqual(len({digest_ids(p.ids) for p in long}), 1)
+            self.assertEqual(short[0].ids, long[-1].ids[:128])
+            self.assertEqual([p.manifest() for p in short], [p.manifest() for p in repeat])
+            self.assertNotEqual(short[0].ids, changed[0].ids)
+            self.assertTrue(all(p.shared_tokens == 128 for p in short))
+            self.assertEqual([p.seed for p in short], [60, 61, 62, 63])
+
+        def test_mode0_private_tail_and_output_budget(self):
+            # 112 shared input + 4 * (16 private input tail + 32 output).
+            self.assertEqual(identical_prefix_cost(128, 4, 17, 16), 304)
+            self.assertEqual(identical_prefix_cost(129, 4, 17, 16), 320)
+            a = config(mode=0, output_tokens=17, capacity_fraction=1)
+            prompts, plan = make_case(a, FakeTokenizer(), 304, 16, 4, 128, 60)
+            self.assertEqual(len(prompts), 8)
+            self.assertTrue(all(r['estimated_kv_tokens'] == 304 for r in plan['rank_plans']))
+            with self.assertRaisesRegex(CapacityError, 'Identical-prefix KV'):
+                make_case(a, FakeTokenizer(), 304, 16, 4, 129, 60)
+            a.allow_shared_prefix = True
+            again, same = make_case(a, FakeTokenizer(), 304, 16, 4, 128, 60)
+            self.assertEqual([p.manifest() for p in prompts], [p.manifest() for p in again])
+            self.assertEqual(plan, same)
+
+        def test_mode0_sweep_uses_shared_budget_not_bs_times_input(self):
+            a = config(mode=0, output_tokens=8192, input_lengths_k=[4, 64, 100, 150, 190])
+            entries, plan = plan_input_sweep(a, 3500 * 1024, 256, 64, 1048576)
+            self.assertEqual([e['mean'] for e in entries], [n * 1024 for n in a.input_lengths_k])
+            self.assertEqual(plan['policy'], 'identical_prefix_input_bound')
+            self.assertEqual(plan['omitted_requested_input_tokens'], [])
+
+        def test_mode0_sweep_boundary_and_output_exhaustion(self):
+            a = config(mode=0, output_tokens=17, capacity_fraction=1, input_lengths_k=[.0625, .25])
+            entries, plan = plan_input_sweep(a, 304, 16, 4)
+            self.assertEqual([e['mean'] for e in entries], [64, 128])
+            self.assertEqual(entries[-1]['origin'], 'automatic_kv_capacity_boundary')
+            self.assertEqual(plan['effective_input_limit_tokens'], 128)
+            self.assertEqual(plan_input_sweep(a, 191, 16, 4)[0], [])
+            self.assertEqual(plan_input_sweep(a, 192, 16, 4)[0][0]['mean'], 16)
+            a.allow_shared_prefix = True  # This flag must not bypass mode 0 sizing.
+            self.assertEqual(plan_input_sweep(a, 304, 16, 4)[0], entries)
+
+        def test_mode0_sweep_context_limit_and_boundary_inversion(self):
+            a = config(mode=0, output_tokens=17, capacity_fraction=1, input_lengths_k=[.0625, .125])
+            entries, plan = plan_input_sweep(a, 10000, 16, 4, 100)
+            self.assertEqual([e['mean'] for e in entries], [64, 83])
+            self.assertEqual(plan['limiting_factor'], 'context_limit')
+            for bs in (1, 2, 16, 64):
+                for page in (16, 256):
+                    for capacity in (1, 512, 1000, 100000):
+                        _, plan = plan_input_sweep(a, capacity, page, bs)
+                        limit = plan['kv_input_limit_tokens']
+                        if limit:
+                            self.assertLessEqual(identical_prefix_cost(limit, bs, 17, page), capacity)
+                            self.assertGreater(identical_prefix_cost(limit + 1, bs, 17, page), capacity)
+                        else:
+                            self.assertGreater(identical_prefix_cost(1, bs, 17, page), capacity)
+
         def test_default_sweep_adds_3500k_bs64_boundary(self):
             a = config(output_tokens=8192, input_lengths_k=[.5, 1, 2, 4, 8, 16, 32, 64, 100, 128, 160, 190, 200])
             entries, summary = plan_input_sweep(a, 3500 * 1024, 256, 64, 1048576)
@@ -1350,6 +1514,47 @@ def self_test():
             result = summarize([r], 0, 1)
             self.assertAlmostEqual(result['sse_gap_median_ms'], 60)
 
+    class PersistenceTests(unittest.TestCase):
+        def test_atomic_output_keeps_old_file_until_replace(self):
+            with tempfile.TemporaryDirectory() as temp:
+                path = Path(temp) / 'result.json'
+                path.write_text('old')
+                with atomic_text_output(path) as stream:
+                    stream.write('new')
+                    self.assertEqual(path.read_text(), 'old')
+                self.assertEqual(path.read_text(), 'new')
+                self.assertEqual(list(Path(temp).glob('.*.tmp')), [])
+
+        def test_failed_atomic_write_preserves_previous_result(self):
+            with tempfile.TemporaryDirectory() as temp:
+                path = Path(temp) / 'result.json'
+                path.write_text('previous complete snapshot')
+                with self.assertRaisesRegex(RuntimeError, 'simulated'):
+                    with atomic_text_output(path) as stream:
+                        stream.write('incomplete')
+                        raise RuntimeError('simulated interruption')
+                self.assertEqual(path.read_text(), 'previous complete snapshot')
+                self.assertEqual(list(Path(temp).glob('.*.tmp')), [])
+
+        def test_snapshot_plot_opt_in_and_only_completed_points(self):
+            good = dict(status='ok', bs_per_dp=2, mean_input_tokens_requested=128,
+                prefix_workload='independent_synthetic', measurement=dict(
+                    sse_gap_mean_ms=13, sse_gap_median_ms=12, pooled_sse_gap_p99_ms=20,
+                    bs_verification='sampled_per_rank_metrics',
+                    cache_verification='reported_hit_all_requests'))
+            pending = dict(status='running', bs_per_dp=2, mean_input_tokens_requested=256)
+            failed = dict(status='failed', bs_per_dp=2, mean_input_tokens_requested=512)
+            with tempfile.TemporaryDirectory() as temp:
+                out = Path(temp)
+                save_results(out, [good], [{'bs': 2}], False)
+                self.assertFalse((out / 'sse_gap.svg').exists())
+                save_results(out, [good, pending, failed], [{'bs': 2}], True)
+                self.assertEqual((out / 'sse_gap.svg').read_text().count('<circle '), 1)
+                self.assertEqual(json.loads((out / 'results.json').read_text()), [good, pending, failed])
+                self.assertEqual(json.loads((out / 'sweep_plan.json').read_text()), [{'bs': 2}])
+                with (out / 'summary.csv').open() as stream:
+                    self.assertEqual([r['status'] for r in csv.DictReader(stream)], ['ok', 'running', 'failed'])
+
     class HTTPTests(unittest.IsolatedAsyncioTestCase):
         async def asyncSetUp(self):
             self.running = [0, 0]
@@ -1457,6 +1662,109 @@ def self_test():
                 self.assertNotIn('DO_NOT_SAVE_GENERATED_TEXT', content)
                 self.assertNotIn('DO_NOT_SAVE_SERVER_SECRET', content)
 
+        async def test_mode0_shared_input_keeps_all_requests_and_per_rank_checks(self):
+            results, directory = await self.invoke(mode=0, batch_sizes=[1, 2])
+            self.assertEqual([r['status'] for r in results], ['ok', 'ok'])
+            self.assertEqual(self.posts, 18)  # (2 + 4) requests * warm/probe/formal.
+            self.assertEqual(len(self.cache), 2)  # Same input, separate DP caches.
+            self.assertEqual(len({p['sha256'] for r in results for p in r['prompts']}), 1)
+            for r in results:
+                self.assertEqual(r['prefix_workload'], 'fully_shared_synthetic')
+                m = r['measurement']
+                self.assertEqual(m['request_count'], r['bs_per_dp'] * 2)
+                self.assertEqual(m['cache_verification'], 'reported_hit_all_requests')
+                self.assertEqual(m['bs_verification'], 'sampled_per_rank_metrics')
+                self.assertEqual(m['dp_routing'], 'reported_rank_verified_all')
+            self.assertEqual(json.loads((directory / 'config.json').read_text())['run_seed'], 60)
+            self.assertIn('fully_shared_synthetic', (directory / 'sse_gap.svg').read_text())
+
+        async def test_mode0_known_cache_miss_still_fails(self):
+            self.mode = 'cache-miss'
+            with self.assertRaisesRegex(BenchError, 'input tokens cached'):
+                await self.invoke(mode=0)
+
+        async def test_mode0_output_capacity_failure_sends_zero_requests(self):
+            with self.assertRaisesRegex(BenchError, 'No requested BS'):
+                await self.invoke(mode=0, kv_capacity_tokens=100)
+            self.assertEqual(self.posts, 0)
+
+        async def test_checkpoint_and_plot_visible_while_next_case_waits(self):
+            entered, release = asyncio.Event(), asyncio.Event()
+            original_warm = warm_phase
+
+            async def pause_second(session, args, prompts, verify):
+                if not verify and len(prompts[0].ids) == 256:
+                    entered.set()
+                    await release.wait()
+                return await original_warm(session, args, prompts, verify)
+
+            with patch.dict(run.__globals__, warm_phase=pause_second):
+                task = asyncio.create_task(self.invoke(input_lengths_k=[.125, .25]))
+                try:
+                    await asyncio.wait_for(entered.wait(), 5)
+                    self.assertFalse(task.done())
+                    directory = next(Path(self.temp.name).glob('sse_*'))
+                    saved = json.loads((directory / 'results.json').read_text())
+                    self.assertEqual([r['status'] for r in saved], ['ok', 'running'])
+                    initial_plot = (directory / 'sse_gap.svg').read_text()
+                    self.assertEqual(initial_plot.count('<circle '), 1)
+                    with (directory / 'summary.csv').open() as stream:
+                        self.assertEqual([r['status'] for r in csv.DictReader(stream)], ['ok', 'running'])
+                    self.assertTrue((directory / 'sweep_plan.json').exists())
+                    release.set()
+                    results, _ = await task
+                    self.assertEqual([r['status'] for r in results], ['ok', 'ok'])
+                    self.assertEqual((directory / 'sse_gap.svg').read_text().count('<circle '), 2)
+                    self.assertNotEqual(initial_plot, (directory / 'sse_gap.svg').read_text())
+                finally:
+                    release.set()
+                    if not task.done():
+                        task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+
+        async def test_later_failure_keeps_completed_checkpoint_and_plot(self):
+            original_warm = warm_phase
+
+            async def fail_second(session, args, prompts, verify):
+                if not verify and len(prompts[0].ids) == 256:
+                    raise BenchError('simulated later-point failure')
+                return await original_warm(session, args, prompts, verify)
+
+            with patch.dict(run.__globals__, warm_phase=fail_second):
+                with self.assertRaisesRegex(BenchError, 'later-point'):
+                    await self.invoke(input_lengths_k=[.125, .25])
+            directory = next(Path(self.temp.name).glob('sse_*'))
+            results = json.loads((directory / 'results.json').read_text())
+            self.assertEqual([r['status'] for r in results], ['ok', 'failed'])
+            self.assertEqual((directory / 'sse_gap.svg').read_text().count('<circle '), 1)
+
+        async def test_cancelled_later_case_preserves_completed_results(self):
+            entered, release = asyncio.Event(), asyncio.Event()
+            original_warm = warm_phase
+
+            async def pause_second(session, args, prompts, verify):
+                if not verify and len(prompts[0].ids) == 256:
+                    entered.set()
+                    await release.wait()
+                return await original_warm(session, args, prompts, verify)
+
+            with patch.dict(run.__globals__, warm_phase=pause_second):
+                task = asyncio.create_task(self.invoke(input_lengths_k=[.125, .25]))
+                try:
+                    await asyncio.wait_for(entered.wait(), 5)
+                    task.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await task
+                finally:
+                    release.set()
+                    if not task.done():
+                        task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+            directory = next(Path(self.temp.name).glob('sse_*'))
+            results = json.loads((directory / 'results.json').read_text())
+            self.assertEqual([r['status'] for r in results], ['ok', 'interrupted'])
+            self.assertEqual((directory / 'sse_gap.svg').read_text().count('<circle '), 1)
+
         async def test_openai_completion_no_server_hook(self):
             result, _ = await self.invoke(backend='openai', steady_check='client')
             self.assertEqual(result[0]['status'], 'ok')
@@ -1563,7 +1871,7 @@ def self_test():
             self.assertEqual(frames, ['{"text":"中文"}', '[DONE]'])
 
     suite = unittest.TestSuite()
-    for cls in (PlanningTests, HTTPTests):
+    for cls in (PlanningTests, PersistenceTests, HTTPTests):
         suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(cls))
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     return result.wasSuccessful()
