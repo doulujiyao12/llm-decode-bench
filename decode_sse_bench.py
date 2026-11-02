@@ -11,7 +11,9 @@ Mode 4 also supports /v1/chat/completions with a matching local chat template.
 
 Capacity is per ATTENTION DP rank, not the sum over TP GPUs. Default: read
 SGLang /server_info; otherwise require --max-total-kvcache-length-k (K=1024).
-Default over-capacity behavior: exit BEFORE warmup. --allow-shared-prefix
+Default synthetic sweeps stop each BS at its capacity/context input bound,
+adding the bound once if it replaces larger requested lengths, then move to
+the next BS. Runtime failures still fail the run. --allow-shared-prefix
 opts synthetic cases into shared prefixes, retaining unique suffixes/lengths.
 It never rewrites semantic shadow traffic. Reserve includes full output budget.
 
@@ -56,6 +58,10 @@ from urllib.parse import urlsplit
 
 class BenchError(RuntimeError):
     pass
+
+
+class CapacityError(BenchError):
+    """A recognized KV budget failure, distinct from service/protocol failures."""
 
 
 def log(message):
@@ -116,8 +122,9 @@ def plan_sharing(lengths, budget, output_tokens, page, allow, min_suffix):
     independent = rank_cost(lengths, none, output_tokens, page)
     if independent <= budget:
         return none, independent
-    check(allow, f'Independent KV needs {independent:,} tokens/rank, usable budget '
-                 f'{budget:,}. Reduce BS/context/output or explicitly add --allow-shared-prefix.')
+    if not allow:
+        raise CapacityError(f'Independent KV needs {independent:,} tokens/rank, usable budget '
+                            f'{budget:,}. Reduce BS/context/output or explicitly add --allow-shared-prefix.')
     max_shared = [max(0, n - min_suffix) // page * page for n in lengths]
     check(rank_cost(lengths, max_shared, output_tokens, page) <= budget,
           'Even maximal shared prefixes + unique suffixes + output budget do not fit. '
@@ -136,6 +143,59 @@ def plan_sharing(lengths, budget, output_tokens, page, allow, min_suffix):
     if rank_cost(lengths, shares, output_tokens, page) > budget:
         shares = max_shared
     return shares, rank_cost(lengths, shares, output_tokens, page)
+
+
+def plan_input_sweep(args, capacity, page, bs, context_length=None):
+    """Plan means before allocating prompts; never exceed the user's max target.
+
+    Uniform input has an exact page-aligned pool bound. Mixed input reserves
+    worst-case page tails for every request and uses its configured max length
+    ratio for context, keeping the selected endpoint safe for every rank/seed.
+    Real text has cohort-dependent prefix sharing: its original content is
+    checked by make_case, never shortened or assigned an artificial endpoint.
+    """
+    requested = [round(k * 1024) for k in args.input_lengths_k]
+    summary = dict(bs_per_dp=bs, requested_input_tokens=requested,
+                   budget_tokens_per_rank=math.floor(capacity * args.capacity_fraction),
+                   output_reserve_tokens_per_request=rounded(args.output_tokens, page))
+    if args.allow_shared_prefix or args.mode == 4:
+        summary.update(policy='shared_prefix_requested_grid' if args.allow_shared_prefix else 'real_text_preflight',
+                       auto_added_input_tokens=[], omitted_requested_input_tokens=[])
+        grid = requested if args.allow_shared_prefix else sorted(set(requested))
+        return [dict(mean=n, origin='requested') for n in grid], summary
+
+    budget = summary['budget_tokens_per_rank']
+    output = summary['output_reserve_tokens_per_request']
+    mixed = args.mode in (2, 3) and bs > 1
+    per_input_budget = budget // bs - output
+    if mixed:
+        per_input_budget -= page - 1  # Every request may have a different last-page tail.
+    kv_limit = max(0, per_input_budget // page * page)
+    context_limit = None
+    if type(context_length) is int and context_length > 0:
+        remaining = max(0, context_length - args.output_tokens)
+        context_limit = math.floor(remaining / args.max_length_ratio) if mixed else remaining
+    limit = min(kv_limit, context_limit) if context_limit is not None else kv_limit
+    limit = max(0, limit)
+    unique = sorted(set(requested))
+    selected = [n for n in unique if n <= limit]
+    omitted = [n for n in unique if n > limit]
+    if context_limit is not None and context_limit < kv_limit:
+        reason = 'context_limit'
+    elif context_limit == kv_limit:
+        reason = 'kv_and_context_limit'
+    else:
+        reason = 'kv_capacity'
+    added = [limit] if omitted and limit > 0 and limit not in selected else []
+    entries = [dict(mean=n, origin='requested') for n in selected]
+    entries.extend(dict(mean=n, origin='automatic_' + reason + '_boundary') for n in added)
+    summary.update(policy='independent_input_bound',
+                   bound_kind='conservative_mixed_mean' if mixed else 'uniform_page_aligned',
+                   kv_input_limit_tokens=kv_limit, context_input_limit_tokens=context_limit,
+                   effective_input_limit_tokens=limit, limiting_factor=reason,
+                   selected_input_tokens=[entry['mean'] for entry in entries],
+                   auto_added_input_tokens=added, omitted_requested_input_tokens=omitted)
+    return entries, summary
 
 
 def natural_prefix_cost(sequences, output_tokens, page):
@@ -311,8 +371,9 @@ def make_case(args, tokenizer, capacity, page, bs, mean, run_seed, shadows=None)
             cohort = cohorts[rank]
             lengths = [len(x[0]) for x in cohort]
             cost = natural_prefix_cost([x[0] for x in cohort], args.output_tokens, page)
-            check(cost <= budget, f'Shadow rank {rank}: {cost:,} KV tokens > usable {budget:,}; '
-                  'artificial prefix sharing would change semantics and is not applied.')
+            if cost > budget:
+                raise CapacityError(f'Shadow rank {rank}: {cost:,} KV tokens > usable {budget:,}; '
+                                    'artificial prefix sharing would change semantics and is not applied.')
             shared = [0] * bs
         else:
             lengths = ([mean] * bs if args.mode == 1 else mixed_lengths(
@@ -826,13 +887,37 @@ async def run(args):
             run_seed=run_seed, notes='No generated text or source prompts saved; seeds do not guarantee deterministic outputs'),
             ensure_ascii=False, indent=2), encoding='utf-8')
         results = []
+        sweep_plans = []
         try:
             for bs in args.batch_sizes:
-                for mean_k in args.input_lengths_k:
-                    mean = round(mean_k * 1024)
-                    case = dict(bs_per_dp=bs, mean_input_tokens_requested=mean, status='failed')
+                entries, sweep = plan_input_sweep(args, capacity, page, bs, info.get('context_length'))
+                sweep_plans.append(sweep)
+                if sweep.get('omitted_requested_input_tokens'):
+                    log(f'BS/rank={bs}: independent input bound '
+                        f'{sweep["effective_input_limit_tokens"] / 1024:g}K '
+                        f'({sweep["limiting_factor"]}); larger requested lengths omitted. '
+                        f'Automatic boundary: {sweep["auto_added_input_tokens"] or "already on grid / no positive input fits"}. '
+                        'Continue remaining BS values after this grid.')
+                if not entries:
+                    results.append(dict(bs_per_dp=bs, status='capacity_limited',
+                        theoretical_input_limit_tokens=sweep['effective_input_limit_tokens'],
+                        reason='No positive input fits this BS after output, page and safety reserves'))
+                    continue
+                for entry in entries:
+                    mean = entry['mean']
+                    case = dict(bs_per_dp=bs, mean_input_tokens_requested=mean, status='failed',
+                                input_length_origin=entry['origin'],
+                                theoretical_input_limit_tokens=sweep.get('effective_input_limit_tokens'))
                     results.append(case)
-                    prompts, plan = make_case(args, tokenizer, capacity, page, bs, mean, run_seed, shadows)
+                    try:
+                        prompts, plan = make_case(args, tokenizer, capacity, page, bs, mean, run_seed, shadows)
+                    except CapacityError as exc:
+                        if args.allow_shared_prefix:
+                            raise
+                        case.update(status='capacity_limited', reason=str(exc))
+                        sweep['stopped_at_input_tokens'] = mean
+                        log(f'BS/rank={bs}: {exc}; ending this BS, continuing the next BS.')
+                        break
                     case.update(plan)
                     context = info.get('context_length')
                     if isinstance(context, int):
@@ -861,14 +946,18 @@ async def run(args):
                     log(f'SSE gap mean/median/P99={m["sse_gap_mean_ms"]:.3f}/'
                         f'{m["sse_gap_median_ms"]:.3f}/{m["pooled_sse_gap_p99_ms"]:.3f} ms; '
                         f'{m["bs_verification"]}, {m["cache_verification"]}')
+            check(any(r['status'] in {'ok', 'planned_not_run'} for r in results),
+                  'No requested BS has a feasible input case; reduce BS/output or increase the KV budget.')
         except Exception as exc:
-            if results:
+            if results and results[-1]['status'] == 'failed':
                 results[-1]['error'] = str(exc) if isinstance(exc, BenchError) else type(exc).__name__
             raise
         finally:
             (out / 'results.json').write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding='utf-8')
+            (out / 'sweep_plan.json').write_text(json.dumps(sweep_plans, ensure_ascii=False, indent=2), encoding='utf-8')
             with (out / 'summary.csv').open('w', newline='', encoding='utf-8') as f:
                 fields = ['status', 'bs_per_dp', 'mean_input_tokens_requested', 'prefix_workload',
+                          'input_length_origin', 'theoretical_input_limit_tokens',
                           'sse_gap_mean_ms', 'sse_gap_median_ms', 'pooled_sse_gap_p99_ms',
                           'bs_verification', 'cache_verification']
                 writer = csv.DictWriter(f, fieldnames=fields, extrasaction='ignore')
@@ -1009,6 +1098,71 @@ def self_test():
         return a
 
     class PlanningTests(unittest.TestCase):
+        def test_default_sweep_adds_3500k_bs64_boundary(self):
+            a = config(output_tokens=8192, input_lengths_k=[.5, 1, 2, 4, 8, 16, 32, 64, 100, 128, 160, 190, 200])
+            entries, summary = plan_input_sweep(a, 3500 * 1024, 256, 64, 1048576)
+            self.assertEqual(summary['effective_input_limit_tokens'], 44800)  # 43.75K
+            self.assertEqual([e['mean'] for e in entries][-2:], [32768, 44800])
+            self.assertEqual(entries[-1]['origin'], 'automatic_kv_capacity_boundary')
+            self.assertEqual(summary['auto_added_input_tokens'], [44800])
+            self.assertIn(200 * 1024, summary['omitted_requested_input_tokens'])
+            self.assertLessEqual(rank_cost([44800] * 64, [0] * 64, 8192, 256), 3500 * 1024 * .95)
+            self.assertGreater(rank_cost([44801] * 64, [0] * 64, 8192, 256), 3500 * 1024 * .95)
+
+        def test_sweep_never_extends_past_requested_max(self):
+            a = config(input_lengths_k=[.5, 1, 2])
+            entries, summary = plan_input_sweep(a, 1000000, 16, 2, 8192)
+            self.assertEqual([e['mean'] for e in entries], [512, 1024, 2048])
+            self.assertEqual(summary['auto_added_input_tokens'], [])
+
+        def test_sweep_existing_boundary_is_not_duplicated(self):
+            a = config(output_tokens=8192, input_lengths_k=[32, 43.75, 200])
+            entries, summary = plan_input_sweep(a, 3500 * 1024, 256, 64)
+            self.assertEqual([e['mean'] for e in entries], [32768, 44800])
+            self.assertEqual(entries[-1]['origin'], 'requested')
+            self.assertEqual(summary['auto_added_input_tokens'], [])
+
+        def test_sweep_sorted_deduplicated_and_all_above_bound(self):
+            a = config(output_tokens=8192, input_lengths_k=[200, 32, 32, .5, 64])
+            entries, _ = plan_input_sweep(a, 3500 * 1024, 256, 64)
+            self.assertEqual([e['mean'] for e in entries], [512, 32768, 44800])
+            a.input_lengths_k = [200]
+            entries, _ = plan_input_sweep(a, 3500 * 1024, 256, 64)
+            self.assertEqual([e['mean'] for e in entries], [44800])
+
+        def test_sweep_no_positive_input_with_output_budget_exhausted(self):
+            entries, summary = plan_input_sweep(config(output_tokens=8192), 1000, 256, 64)
+            self.assertEqual(entries, [])
+            self.assertEqual(summary['effective_input_limit_tokens'], 0)
+
+        def test_sweep_context_limit_includes_output(self):
+            a = config(output_tokens=512, input_lengths_k=[1, 4])
+            entries, summary = plan_input_sweep(a, 100000, 16, 1, 4096)
+            self.assertEqual([e['mean'] for e in entries], [1024, 3584])
+            self.assertEqual(summary['limiting_factor'], 'context_limit')
+            self.assertEqual(entries[-1]['origin'], 'automatic_context_limit_boundary')
+
+        def test_mixed_sweep_bound_is_safe_across_lengths_and_page_tails(self):
+            for mode in (2, 3):
+                a = config(mode=mode, output_tokens=128, input_lengths_k=[1, 2])
+                for bs in (1, 8, 32):
+                    entries, summary = plan_input_sweep(a, 12000, 16, bs, 2048)
+                    mean = entries[-1]['mean']
+                    for seed in range(20):
+                        lengths = mixed_lengths(bs, mean, a.min_length_ratio, a.max_length_ratio, random.Random(seed))
+                        self.assertLessEqual(rank_cost(lengths, [0] * bs, a.output_tokens, 16), 11400)
+                        self.assertLessEqual(max(lengths) + a.output_tokens, 2048)
+
+        def test_shared_and_semantic_grids_are_not_rewritten(self):
+            a = config(allow_shared_prefix=True, input_lengths_k=[200, 32, 32])
+            entries, summary = plan_input_sweep(a, 100, 256, 64)
+            self.assertEqual([e['mean'] for e in entries], [204800, 32768, 32768])
+            self.assertEqual(summary['auto_added_input_tokens'], [])
+            a.mode, a.allow_shared_prefix = 4, False
+            entries, summary = plan_input_sweep(a, 100, 256, 64)
+            self.assertEqual([e['mean'] for e in entries], [32768, 204800])
+            self.assertEqual(summary['policy'], 'real_text_preflight')
+
         def test_equal_and_mixed_exact_rank_means(self):
             for mode in (1, 2, 3):
                 for bs in (1, 8, 16, 17, 32, 64):
@@ -1357,8 +1511,35 @@ def self_test():
                 await self.invoke()
 
         async def test_capacity_failure_sends_zero_requests(self):
-            with self.assertRaisesRegex(BenchError, 'Independent KV'):
+            with self.assertRaisesRegex(BenchError, 'No requested BS'):
                 await self.invoke(kv_capacity_tokens=100)
+            self.assertEqual(self.posts, 0)
+
+        async def test_bounded_sweep_continues_next_bs_and_records_actual_grid(self):
+            results, directory = await self.invoke(kv_capacity_tokens=512, plan_only=True,
+                batch_sizes=[1, 2], input_lengths_k=[.125, .25, .5])
+            self.assertEqual([(r['bs_per_dp'], r['mean_input_tokens_requested']) for r in results],
+                             [(1, 128), (1, 256), (1, 416), (2, 128), (2, 176)])
+            self.assertTrue(all(r['status'] == 'planned_not_run' for r in results))
+            self.assertEqual(results[-1]['input_length_origin'], 'automatic_kv_capacity_boundary')
+            self.assertEqual(results[-1]['prefix_workload'], 'independent_synthetic')
+            plans = json.loads((directory / 'sweep_plan.json').read_text())
+            self.assertEqual([p['auto_added_input_tokens'] for p in plans], [[416], [176]])
+            self.assertEqual(self.posts, 0)
+
+        async def test_bounded_sweep_measures_auto_added_endpoint(self):
+            results, _ = await self.invoke(kv_capacity_tokens=512, input_lengths_k=[.125, .25])
+            self.assertEqual([r['mean_input_tokens_requested'] for r in results], [128, 176])
+            self.assertTrue(all(r['status'] == 'ok' for r in results))
+            self.assertTrue(all(r['measurement']['cache_verification'] == 'reported_hit_all_requests' for r in results))
+            self.assertEqual(self.posts, 24)
+
+        async def test_impossible_bs_does_not_stop_other_bs(self):
+            results, directory = await self.invoke(kv_capacity_tokens=200, plan_only=True,
+                batch_sizes=[4, 1], input_lengths_k=[.125])
+            self.assertEqual(results[0]['status'], 'capacity_limited')
+            self.assertEqual(results[1]['status'], 'planned_not_run')
+            self.assertEqual(results[1]['bs_per_dp'], 1)
             self.assertEqual(self.posts, 0)
 
         async def test_plan_only_has_zero_generation(self):
