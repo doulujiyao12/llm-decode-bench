@@ -25,13 +25,12 @@
 复制 `decode_sse_bench.py` 和整个 `shadow/` 目录即可。无需解压，模式 4 默认选择基础集；显式传文件可以避免把基础集和长上下文集混在一起。
 
 ```bash
-python3 -m pip install aiohttp transformers
+python3 -m pip install aiohttp
 
-# 先以小规模确认接口、容量和目标 tokenizer 的长度；不发送生成请求
+# 默认读取样本中的 reference_content_tokens，无需本地 tokenizer；不发送生成请求
 python3 decode_sse_bench.py \
   --base-url http://127.0.0.1:31000 \
   --backend sglang --model your-served-model \
-  --tokenizer /path/to/matching-tokenizer \
   --mode 4 --shadow-dir shadow/basic.jsonl.gz \
   --dp-size 1 --batch-sizes 4 --input-lengths-k 6 \
   --min-length-ratio 0.1 --max-length-ratio 4 \
@@ -52,7 +51,11 @@ python3 decode_sse_bench.py \
 
 40 条文本不足以填满全机 256 个互不重复的请求，且不同目标均值下符合长度范围的样本可能更少。脚本会报错，不会循环复用补到目标并发。大并发、64K/100K 等指定均值测试，应另准备数量和长度足够的真实数据，或使用模式 1～3 的明确标注的合成输入。
 
-基础集的 512 条只保证总样本数；指定均值、长度上下限、目标模型 tokenizer 和每-rank 分组约束仍可能使可选数量不足。脚本打印重新分词后的长度统计，按这些统计设置均值和范围，实际每-rank 均值保存在结果中。
+基础集的 512 条只保证总样本数；指定均值、长度上下限和每-rank 分组约束仍可能使可选数量不足。不提供 tokenizer 时按记录的参考长度选择；提供时仅对纯文本本地分词。预热后记录服务实际输入长度，图表使用实际均值。
+
+模式 5 按桶随机抽取，不匹配平均长度，例如 `--mode 5 --input-lengths-k 8`。此数据文件没有原始长度桶名称，默认全部落入 `[0,32K)`；若想按片段长度细分，可加 `--shadow-bucket-boundaries-k 0 4 8 16 32`，此时 8K 选择 `[8K,16K)`。每个桶仍需有足够多的不同文本；它不会借用其他桶来补足并发。
+
+服务器原始捕获数据如 `{"meta":{"prompt_tokens_offline":100000,"prompt_bucket":"064_128k"},"body":{"messages":...,"tools":...}}` 也可以直接指定目录。脚本在内存中将真实对话和工具历史提取为通用文本，保留完整内容，不需要模型专用模板或编码器。原始私有文件不会自动加入本仓库。
 
 ## 原有包入口
 

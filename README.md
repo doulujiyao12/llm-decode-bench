@@ -11,13 +11,15 @@ Portable fixed-cohort, mixed-length decode benchmarks. SSE-only by default; opti
 **只复制仓库根目录的 `decode_sse_bench.py` 即可运行，不依赖本仓库其他模块。** 不修改服务启动参数、不安装插件、不抓 GPU trace、不清空服务缓存。认证读取 `OPENAI_API_KEY`，客户端不需要 GPU。
 
 ```bash
-python3 -m pip install aiohttp transformers
+python3 -m pip install aiohttp
+# 模式 0～3，以及可选的本地精确计数，另安装 transformers
+# python3 -m pip install transformers
 python3 decode_sse_bench.py --help
 # 可选：内置单测 + 本机 HTTP 模拟测试，不使用模型/GPU
 python3 decode_sse_bench.py --self-test
 ```
 
-### 五种输入模式
+### 六种输入模式
 
 | `--mode` | 长度与内容 | 可复现性 |
 | --- | --- | --- |
@@ -25,22 +27,50 @@ python3 decode_sse_bench.py --self-test
 | `1` | 每个请求同长度，独立随机 token 前缀 | 固定输入和生成种子 |
 | `2` | 每个 rank 长短混合，整数 token 的平均值严格等于指定值，独立前缀 | 固定长度分配、输入和生成种子 |
 | `3` | 同样严格保持每 rank 平均值，每次重新随机分配长度和输入 | 记录有效 `run_seed`，可用 `--replay-seed` 重放 |
-| `4` | 从真实 JSON/JSONL 影子数据中选取不同的完整文本/对话 | 每次随机选取，记录种子和输入哈希；**不截断、不补文本、不重复凑并发** |
+| `4` | 真实纯文本；组合不同请求，使每个 rank 的平均规划长度接近指定值 | 默认随机；`--replay-seed 60` 固定选样、分组和生成种子 |
+| `5` | 找到包含指定长度的分桶，从桶中随机抽取 `DP × BS` 条不同请求，不匹配均值 | 默认随机；`--replay-seed 60` 可重放 |
 
 `--input-lengths-k` 在模式 2～4 表示**每个 rank 的平均输入长度**，K=1024。模式 2/3 默认长度范围为平均值的 0.25～1.75 倍，可用 `--min-length-ratio` / `--max-length-ratio` 修改。BS=1 时不可能形成长短混合。
 
+**模式 4/5 默认直接发送纯文本，不需要本地 tokenizer 或 chat template。** 有 `text/prompt` 字符串时原样使用；原始 `{"meta":...,"body":...}` 或 `messages/conversations` 会按固定通用格式提取角色、文本分段、reasoning、工具定义、工具调用及返回值。不会把多条请求的正文拼接成一条，也不截断、补齐或重复文本。`/generate` 发送 `text`，`/v1/completions` 发送字符串 `prompt`。`openai-chat` 将全文放入一条 user 消息，由服务自己套模板。
+
+不提供 `--tokenizer` 时，规划长度来自数据中的 `reference_content_tokens`、`reference_input_tokens`、`input_tokens`、`prompt_tokens`、`input_len`、`meta.prompt_tokens_offline` 等参考字段；自定义字段可用 `--shadow-length-field some.path`。没有参考长度就报错，不用字符数猜 token。提供 `--tokenizer` 时仅对纯文本调用 encode 做本地计数，仍发送字符串，仍不套 chat template。
+
+参考长度不等于新模型的实际输入长度。预热后读取服务 `prompt_tokens/usage`，记录实际均值，并重新检查上下文及保守 KV 预算；正式请求使用同一份原文，缓存命中比例按服务实际 token 数校验。mode 4 的均值容差作用于**规划长度**，不会为了追上服务实测均值重新改写/填充正文。
+
+模式 5 的 `--input-lengths-k` 仅用来选桶：例如 100K 命中 `[64K,128K)`，128K 命中 `[128K,208K)`，它们都是左闭右开；抽出的平均值不必接近 100K/128K。优先识别 `meta.prompt_bucket` 或 `prompt_064_128k.jsonl.gz` 一类文件/目录名；没有来源分桶时按 `0,32,64,128,208,256K,+∞` 划桶。可用 `--shadow-bucket-boundaries-k 0 16 32 64 128 256` 覆盖。mode 5 不使用均值容差和最短/最长比例筛选；桶内去重后不足 `DP×BS` 就失败，不跨桶借样本、不重复凑数。
+
+```bash
+# 已启动服务：模式 4，按参考均值组合真实请求；无需 --tokenizer
+python3 decode_sse_bench.py \
+  --base-url http://127.0.0.1:31000 --backend openai --model your-served-model \
+  --mode 4 --shadow-dir /path/to/captured-shadow \
+  --dp-size 8 --batch-sizes 16 32 64 --input-lengths-k 64 100 150 \
+  --replay-seed 60 --max-total-kvcache-length-k 3500 \
+  --output-tokens 8192 --ignore-eos --measure-seconds 10 --plot
+
+# 模式 5：只从包含 100K 的桶随机抽取；先只检查数据/预算
+python3 decode_sse_bench.py \
+  --base-url http://127.0.0.1:31000 --backend openai --model your-served-model \
+  --mode 5 --shadow-dir /path/to/captured-shadow \
+  --dp-size 8 --batch-sizes 64 --input-lengths-k 100 \
+  --replay-seed 60 --max-total-kvcache-length-k 3500 --plan-only
+```
+
+实际 KV 容量应按服务填写，能自动探测时可不指定。要固定 SGLang 每-rank 归属，使用 `--backend sglang`，它同样接收纯文本；普通 V1 接口不保证 DP 路由。要严格验证每卡 running BS，加 `--steady-check required` 并指向现有 metrics。
+
 **模式 0 是显式的共享前缀摸高模式，不需要加 `--allow-shared-prefix`。** 例如 `--mode 0 --batch-sizes 16 32 64 --input-lengths-k 4 64 100 150 190 --seed 60`：同一输入长度下，所有请求、所有 BS、所有 rank 的输入 token 都完全相同；100K 输入也是同一条 190K 序列的前 100K。固定 tokenizer 和输入种子可复现这条序列，改变 `--generation-seed` 不会改变输入。各请求仍独立生成输出，生成种子为基准值加请求编号，不能假设输出也共享。
 
-模式 0 不复制旧脚本缺少验证的行为：仍按当前测试点的实际输入长度预热，再逐条检查缓存命中，保留逐 rank 稳态检查和所有并发请求。不会仅预热最长输入，就假定所有较短截断位置也已命中。相同输入不代表不同 GPU 自动共用显存；容量始终按每个 DP rank 分别计算。结果的 `prefix_workload` 标记为 `fully_shared_synthetic`，不要与 mode 1 的独立前缀结果混淆。
+默认 `--warmup-strategy per-case` 仍按当前测试点的实际输入长度预热，再逐条检查缓存命中；也可对 mode 0～3 显式使用下面的 `once-max`，只预热一次、命中率仅记录。两种策略都保留逐 rank 稳态检查和所有并发请求。相同输入不代表不同 GPU 自动共用显存；容量始终按每个 DP rank 分别计算。结果的 `prefix_workload` 标记为 `fully_shared_synthetic`，不要与 mode 1 的独立前缀结果混淆。
 
 模式 4 的自然长度不一定能凑出精确均值：默认容差 1%，`--shadow-mean-tolerance` 可调整；找不到符合要求的样本集合就失败，不会悄悄改内容。真实输入文件放在自选目录：
 
 ```json
-{"text":"完整的真实请求文本"}
-{"messages":[{"role":"user","content":"完整的真实问题"}]}
+{"text":"完整的真实请求文本", "reference_input_tokens":8192}
+{"messages":[{"role":"user","content":"完整的真实问题"}], "input_tokens":8192}
 ```
 
-也支持标准 ShareGPT `conversations`。需要足够多的不同请求；暂不接受图像/工具调用数据，避免丢字段改变语义。不会把原始输入或生成内容保存到结果，更不会自动上传影子数据。
+也支持标准 ShareGPT `conversations`。需要足够多的不同请求；支持工具历史的文本化，图像/音视频记录仍跳过。不会把原始输入或生成内容保存到结果，更不会自动上传影子数据。
 
 仓库现在附带已获源数据所有者公开授权的 [真实影子文本样本](shadow/README.md)：`shadow/basic.jsonl.gz` 有 **512 个脱敏真实内容片段（来自 39 条源请求）**，`shadow/long-context.jsonl.gz` 有 **40 条完整渲染文本**；合计约 **10.58 MB**。512 个片段不是 512 条独立生产请求。模式 4 不传 `--shadow-dir` 时默认读取基础集；也可以指定一个 `.jsonl.gz` 文件，无需解压。基础集约 2K～16K，不能拿来冒充 100K 上下文数据。具体命令、样本来源、长文本数量限制和校验值见数据说明。
 
@@ -60,7 +90,108 @@ python3 decode_sse_bench.py \
 
 `--ignore-eos` 仅用于已支持该参数的服务，不支持就去掉；输出过早结束时本组失败，不会拿剩余请求冒充原 BS。换模式只需改 `--mode`；模式 4 另加 `--shadow-dir /path/to/traffic`。种子固定的是请求内容和采样参数，**不保证跨后端/批处理顺序的输出逐字一致**。
 
-脚本会依次：构造完整请求集合 → 容量预检 → 每个输入预热 1 token → 再探测全部输入的缓存命中 → 同时发送正式请求 → 所有流开始持续输出后等待 3 秒 → 采集 10 秒公共窗口。默认继续读完输出，校验最终 usage；并不补充新请求。
+默认 `per-case` 流程：构造完整请求集合 → 容量预检 → 每个输入预热 1 token → 再探测全部输入的缓存命中 → 同时发送正式请求 → 所有流开始持续输出后等待 3 秒 → 采集 10 秒公共窗口。默认继续读完输出，记录最终 usage；并不补充新请求。
+
+### mode 0～5：测完窗口立即保存、取消并清理本组请求
+
+在原命令中加入（重复的时间参数直接替换）：
+
+```bash
+--steady-check required \
+--settle-seconds 3 \
+--measure-seconds 5 \
+--stop-after-measure \
+--cleanup-timeout 120 \
+--cleanup-polls 3
+```
+
+流程是：**原有预热/探测 → 每卡达到目标 BS、所有请求持续输出 → 稳定等待 → 采集窗口 → 校验窗口内正式请求的缓存计数并保存 JSON/CSV → 取消本组请求 → 连续确认各 rank 空闲 → 保存清理结果并更新图 → 下一测试点**。`--output-tokens` 是防止提前结束的输出预算，不再要求全部生成完。默认行为不变：不加 `--stop-after-measure` 仍排空完整输出。
+
+- 所有 mode 0～5 都支持。`--warmup-strategy once-max` 仍仅支持 mode 0～3，开启后继续只预热一次、缓存门槛仅记录；测完取消功能不改变这些规则。
+- SGLang native `/generate`：记录本组每条请求的随机 `rid`，关闭本组流，并对这些 ID 调用 `/abort_request`，始终发送 `abort_all=false`。兼容空响应体的 HTTP 200，不把“取消已受理”当成“请求已退出”。不清缓存，不停止服务，不取消其他请求。
+- 必须有可读取的逐 rank metrics。每点开始前确认所选 rank 空闲；取消后默认连续 3 次检查 running、waiting 均为 0。加 `--pd-metrics` 时还检查 D 的 prealloc/transfer。测试服务应独占这些 rank；遇到其他流量只等待，不会清理别人的请求。
+- OpenAI/OpenAI-chat 没有通用的逐请求取消 API：只关闭自己的流，再通过配置的 metrics 确认空闲；不伪称执行了 native abort。服务若不响应断连取消，达到超时后停止，不继续污染下一点。缺少 metrics 时，这个提前结束选项会在生成请求前拒绝；可不用该选项，保留原有完整输出方式。
+- 结果先以 `measured_cleanup_pending` 保存，已经包含窗口统计和缓存报告；清理通过才变成 `ok` 并更新图。清理失败为 `cleanup_failed`，保留测得窗口并停止矩阵。`measurement.cleanup` 记录受理数量、最后的 rank 状态及确认方式。中断也不把已保存窗口删掉。
+- `final_usage_complete=false`、`usage_scope=stream_observed_at_window_end` 明确表示主动提前结束；每请求 `completion_tokens` 是窗口结束时观察到的值，不是完整输出量。不返回最终 usage 的接口不会被伪造为已验证缓存。此模式只保存窗口内 SSE 时间戳，减少长输出结果体积。
+
+该功能不要求修改或重启服务，但现有 SGLang 必须支持逐请求 abort，并具备相应权限。已启动的旧测试进程不会自动切换到新代码。高并发长输出仍建议在服务启动时使用 `--incremental-streaming-output`，减少累计全文/token-ID 数组造成的解析积压；测试脚本不会自行重启服务或更改 `stream_interval`。SSE 间隔仍不等价于 GPU step。
+
+### mode 0～5：防止积压数据被误当成低延迟
+
+所有模式共用以下两层检查，不改变输入生成、分桶、预热、缓存门槛和测完取消的规则，也不要求安装 GPU 插件或重启服务。
+
+1. **收流与解析分离。** 独立 reader 使用有界队列读取字节，完整 SSE 帧的时间戳取最后一段字节的应用层读取时间，先记时间、再解析 JSON。同一次读取完成的多个帧保留相同时间戳，不人为摊平；每帧让出事件循环。记录解析延迟、队列反压和同次读取的零间隔比例。它不是网卡到达时间：事件循环或 socket 中已有的积压不能仅靠前移时间戳消除。
+2. **核对真实 token 进度。** 在预热/探测结束且 rank 空闲时取计数基线，正式请求期间持续比较每 rank 的服务端已生成 token 与客户端已解析的累计 `completion_tokens`，同时检查绝对积压量和滚动生成速率。积压过大、补读过快、计数停滞或解析落后时，取消候选窗口并重新等稳态。不能只看“BS 已满、队列为空、所有流都有输出”。
+
+建议在原命令中加：
+
+```bash
+--steady-check required \
+--catchup-check required \
+--settle-seconds 3 \
+--measure-seconds 5 \
+--stop-after-measure
+```
+
+`--catchup-check` 的区别：
+
+| 取值 | 行为 |
+| --- | --- |
+| `auto`（默认） | 有可靠指标就检查；缺少支持时警告，结果标为 `unverified`，图上为空心点 |
+| `required` | 必须能核对在线 token 计数；不支持则拒绝，不生成“追平已验证”的结果 |
+| `off` | 显式关闭第二层，结果标为 `disabled`；第一层及解析延迟检查仍启用 |
+
+当前第二层支持 **SGLang native `/generate` + 固定 DP 路由 + 逐 rank `sglang:realtime_tokens_total{mode="decode"}`**。只接受一条对应序列/rank，不把重复 TP/worker 指标相加；沿用 `--metric-label` 过滤。该指标须按实际已接受输出 token 在线更新，排除 prefill 输入量和未接受的 draft；基线实现另外补计每请求由 prefill 生成的首 token。**请求结束才更新的 `sglang:generation_tokens_total` 不能替代它。** 通用 OpenAI 接口通常没有逐帧累计 token 元数据，不能从字符数/帧数猜 token 数；这些接口仍能测 SSE，但第二层会明确标为未验证，`required` 会拒绝。首次启动尚无 decode 指标的服务，也不能凭空假设缺失计数为零。
+
+默认用 **2 秒滚动窗口**，允许 **20% 速率差**；绝对进度差上限为“服务端速率 ×（0.25 秒 + 本次 metrics 请求耗时）+ 每请求 8 token”，容纳采样时差和正常 MTP 在途输出。参数分别是 `--catchup-window-seconds`、`--catchup-rate-tolerance`、`--catchup-max-lag-seconds`、`--catchup-token-slack`。`--client-max-frame-lag` 默认 0.25 秒，超过的收流到解析延迟会重置候选窗口。以上是**有明确容差的采样验证，不是逐请求零积压证明，也不是 GPU step 验证**；不要通过无限放大容差去掩盖异常。计数重置/指标身份变化会失败，运行中指标缺失不会悄悄降级后给出已验证结果。测试期间需独占所选 rank，其他流量会污染服务端计数。
+
+结果新增 `catchup_verification`、`catchup`、`read_to_parsed_p99_ms` / `read_to_parsed_max_ms`、`same_read_gap_fraction`。JSON 保留窗口内逐帧累计 token、解析延迟和 metrics 样本；失败时尽可能保存 `failure_diagnostics`，不保存生成文本。若同次读取零间隔很多，即使已追平，也只能说明传输有合并，不能把低 SSE gap 当成 GPU 加速。图仍是每请求 SSE 中位数的中位数，不除以 MTP。
+
+**省略 `--warmup-concurrency` 时，预热和缓存探测的客户端并发自动等于当前测试点的 `DP × BS`。** 例如 DP8、每卡 BS1/16/64 时，分别最多同时发出 8/128/512 条预热请求；随测试点变化，不固定取整个矩阵的最大 BS。显式设置 `--warmup-concurrency 8` 则保留全机最多 8 条的限制。所有模式 0～5 均适用，日志打印有效值，结果记录 `warmup_concurrency_effective`。这控制的是客户端在途请求数，实际 prefill batch、分块和排队由服务端调度；不保证所有请求同时在 GPU 上计算，也不保证并发越大预热越快。
+
+### mode 0～3：最大输入只预热一次，直接测后续稳态
+
+在原命令加 `--warmup-strategy once-max`。不必再设置 `--min-cache-hit-ratio 0` 或调大 `--cache-tail-tokens`；这两个门槛在此策略下不作为失败条件。
+
+```bash
+python3 decode_sse_bench.py \
+  --base-url http://127.0.0.1:39230 --backend sglang \
+  --model /data1/models/DeepSeek-V4.1-Flash-1017 \
+  --tokenizer /data1/models/DeepSeek-V4.1-Flash-1017 \
+  --dp-size 8 --batch-sizes 16 32 64 \
+  --mode 1 --input-lengths-k 4 64 100 150 190 \
+  --warmup-strategy once-max \
+  --seed 60 --generation-seed 60 \
+  --temperature 0.6 --top-p 0.95 --output-tokens 8192 --ignore-eos \
+  --steady-check required --metrics-url http://127.0.0.1:39230/metrics \
+  --metric-label 'model_name=/data1/models/DeepSeek-V4.1-Flash-1017' \
+  --settle-seconds 3 --measure-seconds 10 \
+  --wait-timeout 3600 --request-timeout 7200 \
+  --plot --save-path results/once_max_mode1
+```
+
+流程：**容量预检 → 一次覆盖整个矩阵的预热（每条生成1 token）→ 直接发送各点正式请求 → 等所有请求达到共同稳态 → 统计 SSE。** 不再发送每点预热或缓存探测请求。BS 自动降序、同一 BS 内输入长度自动降序；例如先 BS64 的 190K→150K→100K→64K→4K，再 BS32，最后 BS16。不要求用户手动倒排参数。原有容量/上下文边界仍适用，实际顺序及自动补入的边界写入 `sweep_plan.json`。
+
+| 模式 | 一次预热如何覆盖后续点 |
+| --- | --- |
+| 0 | 每个 DP rank 预热一条全局最长共享输入，DP8 只需8条，不发512条重复预热 |
+| 1 | 每个 rank 固定最多 `max(BS)` 条独立输入；小 BS 使用前几条，短输入截取对应输入的前缀 |
+| 2 | 同样固定输入；保留每个测试点原有的混合长度分配、严格每-rank平均值，按对应长度截取 |
+| 3 | 每次运行随机生成覆盖输入，本次运行内复用，下次运行重新随机；`--replay-seed` 可重放本次矩阵 |
+
+混合模式的最大平均长度不是最大单条长度。预热按**每个 `(rank, 请求槽位)` 在所有有效测试点的最大实际长度**构造覆盖集合，包含小 BS 才能测到的较长点；不会只取第一个点，也不会把所有混合请求误设为同长。结果保留单条长度与输入 SHA256，既不保存正文也不保存生成内容。种子和 tokenizer 固定时可复现；此策略的 mode 1～3 输入生成方式与旧 `per-case` 不同，比较结果时要注明。
+
+全矩阵覆盖集合加最大并发输出预留也必须能放下。即使每个点单独能运行，其最大长度的并集仍可能超预算；此时在发送任何预热前报错，请缩小矩阵或使用 `per-case`。显式 `--allow-shared-prefix` 时允许固定的容量共享，但必须在所有截断点保留独立后缀；做不到也会提前报错，不默默改变工作负载。
+
+`once-max` **不承诺后续一定高命中**：SWA 较早窗口可能释放，缓存也可能被驱逐。正式请求未命中时由服务正常 prefill，客户端等全部请求持续输出、每卡目标 BS 达标且队列清空后再开始稳态窗口；先前 prefill 等待不计入窗口。稳态超时、请求提前结束、错误 DP 路由或非法 token 计数仍然失败。SSE 是客户端进度间隔，不等价于 GPU step；采样 metrics 也不是逐 GPU step 的阶段证明。
+
+**命中率来自正式请求，不来自预热或额外探测**，完成每个点后打印并增量保存：
+
+- `cache_hits.csv`：每点一行，包含 BS、目标长度、缓存/补算 token 数、加权命中率及计数覆盖率。
+- `cache_hits.json`：同样的汇总，加每个计划 rank 和每条请求的计数、命中率。
+- `once_warmup.json`：唯一预热的长度、SHA256、容量计划、响应及完成状态。
+
+`weighted_hit_ratio = Σ cached_tokens / Σ input_tokens`；`mean_request_hit_ratio` 是每条请求命中率的算术均值，混合长度下两者可能不同。比例为0～1（0.95即95%）。计数缺失记 `unknown`，不伪造为0或100%；部分上报时，加权值仅覆盖已上报请求并标为 `partial`。`cache_verification=report_only` 不宣称高命中或 GPU 常驻。模式 4/5 暂不支持 `once-max`，仍按原流程；默认 `per-case` 也不变。
 
 ### 容量不足：默认测到当前 BS 的上限，可显式共享前缀
 
@@ -89,7 +220,7 @@ python3 decode_sse_bench.py \
 随后进入下一个 BS；64K～200K 不会发送生成请求，也不构造共享前缀。
 ```
 
-模式 1 的 KV 边界是同长输入的精确页对齐边界。模式 2／3 为每个请求预留最坏的末页浪费，并按最长输入比例检查上下文，因此自动补入的是**保守的平均长度边界**，不同 rank 仍保持相同目标均值。模式 4 不裁剪或补写真实输入；若实际选出的真实请求组超出 KV 预算，就记录 `capacity_limited`、结束当前 BS，并继续下一个 BS。
+模式 1 的 KV 边界是同长输入的精确页对齐边界。模式 2／3 为每个请求预留最坏的末页浪费，并按最长输入比例检查上下文，因此自动补入的是**保守的平均长度边界**，不同 rank 仍保持相同目标均值。模式 4/5 按每条完整输入独立占用 KV 做保守估算，不扣除自然共享；若规划超出预算，就记录 `capacity_limited`、结束当前 BS，并继续下一个 BS。参考长度只是预估，预热后还会按服务实测长度重新检查；实际超限会中止，避免发送正式长输出请求。
 
 模式 0 同样自动测到容量/上下文边界，但**不按 `BS × 输入长度` 计算**。按每卡一份共享输入，加上每条请求的私有尾页和输出预留：
 
@@ -98,9 +229,9 @@ python3 decode_sse_bench.py \
                 + BS × (page + ceil(输出token数 / page) × page)
 ```
 
-即使输入恰好页对齐，也预留每条请求重算/复制最后一页的空间。不假设生成结果相同；不忽略 BS 增大时的输出容量。这个预算是 Full KV 规划，不保证 SWA 等其他池一定够用，运行时缓存校验仍必须通过。加 `--allow-shared-prefix` 不改变 mode 0 的逻辑。
+即使输入恰好页对齐，也预留每条请求重算/复制最后一页的空间。不假设生成结果相同；不忽略 BS 增大时的输出容量。这个预算是 Full KV 规划，不保证 SWA 等其他池一定够用；默认 `per-case` 的运行时缓存校验仍必须通过，`once-max` 仅记录命中率。加 `--allow-shared-prefix` 不改变 mode 0 的逻辑。
 
-某个 BS 连输出预留和最小输入都放不下时，会记录为 `capacity_limited` 并继续其他 BS；如果整个矩阵没有任何可运行组，返回非零退出码。网络失败、缓存未命中、请求提前结束、稳态超时、无效 tokenizer 等运行错误仍会中止测试，不能当作容量边界吞掉。
+某个 BS 连输出预留和最小输入都放不下时，会记录为 `capacity_limited` 并继续其他 BS；如果整个矩阵没有任何可运行组，返回非零退出码。网络失败、默认 `per-case` 的缓存门槛未通过、请求提前结束、稳态超时、无效 tokenizer 等运行错误仍会中止测试，不能当作容量边界吞掉。`once-max` 的低缓存命中不属于运行错误。
 
 如果希望保持列表中指定的长输入，即使独立前缀装不下也继续尝试，可显式加：
 
@@ -110,31 +241,33 @@ python3 decode_sse_bench.py \
 
 加了该选项就保留原始输入列表，不执行上述自动长度截断。只有当前组的独立前缀放不下时才启用共享：同一个 rank 的请求共享部分前缀，仍保留独立后缀（默认至少 128 token，`--min-unique-suffix-tokens` 可调），长度和均值保持不变。混合长度采用嵌套共同前缀，使短请求和长请求都能分享已有部分。尽可能少共享到满足预算；即使最大共享仍装不下，也会退出。
 
-**共享前缀会改变显存需求、访问局部性和工作负载，不能把它与独立前缀结果当作同一个基准。** 结果明确记录 `prefix_workload` 和每个请求的共享长度。模式 4 只利用真实内容自然具有的相同前缀，即便加了该参数，也不会人为改写真实请求来省显存。
+**共享前缀会改变显存需求、访问局部性和工作负载，不能把它与独立前缀结果当作同一个基准。** 结果明确记录 `prefix_workload` 和每个请求的共享长度。模式 4/5 即便加了该参数，也不会人为改写真实请求来省显存；服务仍可自然共享相同前缀，客户端容量估算不扣除这部分共享。
 
 想先看容量计划、不发送任何生成请求，加 `--plan-only`。容量预估不是运行时 OOM 保证：其他流量、临时激活、路由、驱逐和不同后端实现仍可能导致失败。本脚本不是 HiSparse 热 KV/CPU offload 容量测量工具。
 
 ### 什么条件才算结果可信
 
-- 缓存：默认要求探测和正式请求都报告 `cached_tokens`，至少命中 98%，且未命中尾部不超过 256 token，两项同时满足。允许少量尾页重算，不宣称 100% 命中；可用 `--min-cache-hit-ratio` 和 `--cache-tail-tokens` 收紧。已知未命中直接失败；接口缺少计数时，仅显式 `--allow-unverified-cache` 才允许继续，并标为 `unverified`。
+- 缓存：默认要求探测和正式请求都报告 `cached_tokens`，至少命中 98%，且未命中尾部不超过 256 token，两项同时满足。允许少量尾页重算，不宣称 100% 命中；可用 `--min-cache-hit-ratio` 和 `--cache-tail-tokens` 调整。命中比例允许范围为 `0～1`；显式设为 `0` 只取消最低命中比例要求，仍检查未命中 token 数不超过 `--cache-tail-tokens`，也仍要求接口报告合法的缓存计数。此时短请求可能完全未命中仍通过检查，不代表全部输入已命中缓存。未满足所设门槛时失败；接口缺少计数时，仅显式 `--allow-unverified-cache` 才允许继续，并标为 `unverified`。
 - 每卡 BS：SGLang native 默认用 `routed_dp_rank` 固定请求归属；如果服务没有该扩展，可加 `--no-route-dp`，但不能再保证每 rank 的长度分布和 cache affinity。通用 OpenAI 接口同理。
 - 稳态：默认尝试读取 metrics，要求所有 rank 的 running 都等于指定 BS、等待队列为 0；缺少指标会明确降级为 `client_only_unverified`。**要强制每卡 BS 验证，加 `--steady-check required`**。可通过 `--metrics-url`、`--running-metric`、`--waiting-metric`、`--rank-label`、`--metric-label` 适配现有服务；全局 running 指标不能冒充多个 rank 的指标。
 - PD：从已部署的完整 router/P-D 入口发请求，不能直接把普通请求发给仅 D 的端口来代替 bootstrap/KV 传输。metrics 需要指向 D；`--pd-metrics` 额外要求 prealloc/transfer 队列清空。路由器未透传 DP pinning 时需关闭 pinning；跨机器/实例前缀不会因客户端预热自动共享。
 - SSE：统计完整生成进度事件之间的间隔，忽略 keepalive、纯 role、usage 和 DONE；不是 TCP 包间隔。MTP 或 `stream_interval` 可能使一次事件含多个 token，也可能把一步拆为多次发送；**不保证一次 SSE 就是一次 GPU step**。
 
-OpenAI-compatible completions 可选 `--backend openai`，需要支持 token-ID `prompt`。仅有 chat 接口的服务使用 `--backend openai-chat --mode 4`，本地 tokenizer/chat template 必须与服务一致；如果服务报告的 prompt token 数不一致就失败，不用字符数冒充 token 数。脚本不保证任意厂商接口都能验证缓存/每卡 BS。
+OpenAI-compatible completions 可选 `--backend openai`：模式 0～3 需要支持 token-ID `prompt`，模式 4/5 发送普通字符串。仅有 chat 接口可用 `--backend openai-chat --mode 4/5`。真实文本模式必须返回实际 prompt token 数；预热、探测、正式请求长度若变化则失败。脚本不保证任意厂商接口都能验证缓存/每卡 BS。
 
 ### 输出文件
 
-每次生成一个 `results/sse_日期时间_随机标识/`：`config.json`、`sweep_plan.json`、`results.json`、`summary.csv`；加 `--plot` 生成 `sse_gap.svg`。图为每请求 SSE gap 中位数的中位数；CSV 同时包含均值和合并间隔的 P99。不除以 MTP 接受长度，也不计算模型精度。
+每次生成一个 `results/sse_日期时间_随机标识/`：`config.json`、`sweep_plan.json`、`results.json`、`summary.csv`，以及独立缓存报告 `cache_hits.json` / `cache_hits.csv`（所有模式、两种预热策略均输出）；`once-max` 另有 `once_warmup.json`。加 `--plot` 生成 `sse_gap.svg`。图为每请求 SSE gap 中位数的中位数；CSV 同时包含均值和合并间隔的 P99。不除以 MTP 接受长度，也不计算模型精度。
+
+模式 4/5 额外记录 `selection`、`selected_bucket`、`length_basis`、`planned_mean_input_tokens`、`actual_mean_input_tokens`。SVG 横轴使用服务实测平均输入长度，悬停显示请求目标和分桶；不把桶选择值或旧模型参考值标成新模型的实测长度。按 rank 的输入统计采用计划分组，是否实际落在对应 rank 要结合 `measurement.dp_routing` 判断。
 
 **边测边保存、边测边画图**：每完成并校验一个 `BS × 输入长度` 测试点，就更新 JSON、CSV；加 `--plot` 时同时更新同一个 `sse_gap.svg`，不必等整套矩阵结束。第一个有效点完成后即可打开 SVG，后续点完成后刷新查看；SVG 文件本身不自动刷新。保存发生在稳态计时之外，不把写盘或绘图耗时混入 SSE 间隔。
 
-开始下一点的预热前也会保存快照，当前点标为 `running`；失败为 `failed`，正常处理的取消/中断为 `interrupted`。图中只包含 `ok` 点，未完成的点不会当作有效结果。正常结束、异常和可处理的中断仍会再保存一次。文件通过同目录临时文件原子替换，避免写到一半截断上一版；原子性针对单个文件，不是四个文件的整体事务。`kill -9` 或断电不能触发最终保存，但之前已保存的完整文件仍可保留；不能保证当前点或最新一轮各文件同时更新。
+开始下一点之前也会保存快照，当前点标为 `running`；失败为 `failed`，正常处理的取消/中断为 `interrupted`。图中只包含 `ok` 点，未完成的点不会当作有效结果。正常结束、异常和可处理的中断仍会再保存一次。文件通过同目录临时文件原子替换，避免写到一半截断上一版；原子性针对单个文件，不是整个结果目录的整体事务。`kill -9` 或断电不能触发最终保存，但之前已保存的完整文件仍可保留；不能保证当前点或最新一轮各文件同时更新。
 
 `config.json` 保留原命令；`sweep_plan.json` 逐 BS 记录理论边界、实际测试点、自动添加点和省略的原始点。`results.json` 和 CSV 的 `mean_input_tokens_requested` 表示该组**实际采用的目标长度**，`input_length_origin` 区分原列表点和自动边界，`theoretical_input_limit_tokens` 给出当前 BS 的上限。不会把 43.75K 的结果标成原命令里的 64K 或 200K。
 
-默认排空输出以拿到最终缓存 usage，采样结束后可能还要等一段时间。`--stop-after-measure` 只关闭本脚本的 HTTP 流，不清缓存、不全局 abort；不同服务可能继续后台生成，OpenAI 最终 usage 也可能缺失，因此通常不建议在连续矩阵中使用。
+默认排空输出以拿到最终 usage，采样结束后可能还要等一段时间。加 `--stop-after-measure` 则按前述流程先保存窗口、取消本组请求，并确认 rank 空闲后继续；不等待完整输出，不清缓存、不全局 abort。清理超时会保留窗口并停止矩阵，最终 usage 缺失会明确标注。
 
 ## 1. 能做什么
 
